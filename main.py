@@ -2,12 +2,12 @@ import logging
 import os
 import re
 import sqlite3
-
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 load_dotenv()
 
@@ -180,30 +180,20 @@ def sync_tracks():
 
 # A plain "def" (not "async def") on purpose: boto3 is blocking, and FastAPI runs
 # plain functions in a worker thread, so a slow upload can't freeze the whole server.
-@app.post("/api/upload")
-def upload_track(file: UploadFile = File(...)):
-    filename = file.filename or ""
+class PresignedUrlRequest(BaseModel):
+    filename: str
+    content_type: str
+
+@app.post("/api/upload/presigned")
+def get_presigned_url(request: PresignedUrlRequest):
+    filename = request.filename or ""
     extension = os.path.splitext(filename)[1].lower()
-    content_type = ALLOWED_UPLOAD_TYPES.get(extension)
-    if content_type is None:
+    content_type = request.content_type
+
+    if extension not in ALLOWED_UPLOAD_TYPES:
         raise HTTPException(
             status_code=400,
             detail="Unsupported file type. Upload an MP3, WAV, or M4A file.",
-        )
-
-    # Read one byte past the limit so an oversized file is detected without loading all of it.
-    data = file.file.read(MAX_UPLOAD_BYTES + 1)
-    if not data:
-        raise HTTPException(status_code=400, detail="The uploaded file is empty.")
-    if len(data) > MAX_UPLOAD_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File is too large. The limit is {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
-        )
-    if not looks_like_audio(data, extension):
-        raise HTTPException(
-            status_code=400,
-            detail=f"This file does not look like a valid {extension[1:].upper()} audio file.",
         )
 
     key = build_object_key(filename, extension)
@@ -214,23 +204,25 @@ def upload_track(file: UploadFile = File(...)):
                 status_code=409,
                 detail=f"A track named '{key}' already exists. Rename the file and try again.",
             )
-        s3_client.put_object(
-            Bucket=R2_BUCKET_NAME,
-            Key=key,
-            Body=data,
-            ContentType=content_type,
+        
+        presigned_url = s3_client.generate_presigned_url(
+            'put_object',
+            Params={
+                'Bucket': R2_BUCKET_NAME,
+                'Key': key,
+                'ContentType': content_type
+            },
+            ExpiresIn=3600
         )
+        return {"url": presigned_url, "key": key}
     except HTTPException:
         raise
     except (ClientError, BotoCoreError):
-        logger.exception("R2 upload failed for key %r", key)
+        logger.exception("R2 presigned URL generation failed for key %r", key)
         raise HTTPException(
             status_code=502,
-            detail="Could not store the file in cloud storage. Check the server logs.",
+            detail="Could not generate upload link. Check the server logs.",
         )
-
-    return {"uploaded": True, "key": key, "size_bytes": len(data)}
-
 
 @app.get("/api/tracks")
 def get_tracks():
