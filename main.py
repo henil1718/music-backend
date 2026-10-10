@@ -1,12 +1,17 @@
+import logging
 import os
+import re
 import sqlite3
 
 import boto3
+from botocore.exceptions import BotoCoreError, ClientError
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
 load_dotenv()
+
+logger = logging.getLogger("uvicorn.error")
 
 R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")
 R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY")
@@ -33,6 +38,17 @@ app.add_middleware(
 )
 
 DB_PATH = "catalog.db"
+
+# File types the catalog understands. The sync step below only picks up these extensions.
+AUDIO_EXTENSIONS = (".mp3", ".m4a", ".wav")
+
+# Upload rules. Keep MAX_UPLOAD_BYTES in sync with MAX_UPLOAD_BYTES in App.js.
+ALLOWED_UPLOAD_TYPES = {
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+    ".m4a": "audio/mp4",
+}
+MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 
 
 def get_connection():
@@ -72,6 +88,55 @@ def get_bucket_storage_bytes():
     )
 
 
+# --- Upload helpers ---------------------------------------------------------
+
+
+def clean_name_part(value: str, fallback: str) -> str:
+    """Make a title/artist safe to use inside an R2 object key."""
+    value = re.sub(r"[\x00-\x1f\x7f/\\]", " ", value)  # control characters and path separators
+    value = re.sub(r"_{2,}", "_", value)  # "__" is the title/artist separator, so it can't appear inside either part
+    value = re.sub(r"\s+", " ", value).strip(" ._")
+    return value[:100] or fallback
+
+
+def build_object_key(filename: str, extension: str) -> str:
+    """
+    Build a key in the "Title__Artist.ext" format that /api/sync understands.
+    "My Song__Some Artist.mp3" keeps its artist; "My Song.mp3" becomes "My Song__Unknown Artist.mp3".
+    """
+    base_name = os.path.basename(filename.replace("\\", "/"))
+    stem = os.path.splitext(base_name)[0]
+    title_part, _, artist_part = stem.partition("__")
+    title = clean_name_part(title_part, "Untitled")
+    artist = clean_name_part(artist_part, "Unknown Artist")
+    return f"{title}__{artist}{extension}"
+
+
+def looks_like_audio(data: bytes, extension: str) -> bool:
+    """Cheap sanity check of the file header so random files can't be stored as audio."""
+    if extension == ".mp3":
+        return data[:3] == b"ID3" or (len(data) > 1 and data[0] == 0xFF and (data[1] & 0xE0) == 0xE0)
+    if extension == ".wav":
+        return data[:4] == b"RIFF" and data[8:12] == b"WAVE"
+    if extension == ".m4a":
+        return data[4:8] == b"ftyp"
+    return False
+
+
+def object_exists(key: str) -> bool:
+    try:
+        s3_client.head_object(Bucket=R2_BUCKET_NAME, Key=key)
+        return True
+    except ClientError as error:
+        code = str(error.response.get("Error", {}).get("Code", ""))
+        if code in {"404", "NoSuchKey", "NotFound"}:
+            return False
+        raise
+
+
+# --- Routes -----------------------------------------------------------------
+
+
 @app.on_event("startup")
 def startup_event():
     initialize_database()
@@ -89,7 +154,7 @@ def sync_tracks():
     with get_connection() as connection:
         for item in response.get("Contents", []):
             key = item["Key"]
-            if not key.lower().endswith((".mp3", ".m4a")):
+            if not key.lower().endswith(AUDIO_EXTENSIONS):
                 continue
 
             filename = os.path.splitext(key)[0]
@@ -111,6 +176,60 @@ def sync_tracks():
             )
 
     return {"synced": True}
+
+
+# A plain "def" (not "async def") on purpose: boto3 is blocking, and FastAPI runs
+# plain functions in a worker thread, so a slow upload can't freeze the whole server.
+@app.post("/api/upload")
+def upload_track(file: UploadFile = File(...)):
+    filename = file.filename or ""
+    extension = os.path.splitext(filename)[1].lower()
+    content_type = ALLOWED_UPLOAD_TYPES.get(extension)
+    if content_type is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported file type. Upload an MP3, WAV, or M4A file.",
+        )
+
+    # Read one byte past the limit so an oversized file is detected without loading all of it.
+    data = file.file.read(MAX_UPLOAD_BYTES + 1)
+    if not data:
+        raise HTTPException(status_code=400, detail="The uploaded file is empty.")
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File is too large. The limit is {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
+        )
+    if not looks_like_audio(data, extension):
+        raise HTTPException(
+            status_code=400,
+            detail=f"This file does not look like a valid {extension[1:].upper()} audio file.",
+        )
+
+    key = build_object_key(filename, extension)
+
+    try:
+        if object_exists(key):
+            raise HTTPException(
+                status_code=409,
+                detail=f"A track named '{key}' already exists. Rename the file and try again.",
+            )
+        s3_client.put_object(
+            Bucket=R2_BUCKET_NAME,
+            Key=key,
+            Body=data,
+            ContentType=content_type,
+        )
+    except HTTPException:
+        raise
+    except (ClientError, BotoCoreError):
+        logger.exception("R2 upload failed for key %r", key)
+        raise HTTPException(
+            status_code=502,
+            detail="Could not store the file in cloud storage. Check the server logs.",
+        )
+
+    return {"uploaded": True, "key": key, "size_bytes": len(data)}
 
 
 @app.get("/api/tracks")
