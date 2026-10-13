@@ -224,6 +224,25 @@ def get_presigned_url(request: PresignedUrlRequest):
             detail="Could not generate upload link. Check the server logs.",
         )
 
+@app.post("/api/upload")
+def upload_file(file: UploadFile = File(...)):
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Filename is required")
+
+    try:
+        s3_client.upload_fileobj(
+            file.file,
+            R2_BUCKET_NAME,
+            file.filename,
+            ExtraArgs={"ContentType": file.content_type or "audio/mpeg"},
+        )
+    except Exception as error:
+        logger.exception("R2 upload failed for %r", file.filename)
+        raise HTTPException(status_code=500, detail="Failed to upload to R2") from error
+
+    return {"uploaded": True, "key": file.filename}
+
+
 @app.get("/api/tracks")
 def get_tracks():
     with get_connection() as connection:
