@@ -8,6 +8,8 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from urllib.parse import unquote
+
 
 load_dotenv()
 
@@ -228,6 +230,7 @@ def get_presigned_url(request: PresignedUrlRequest):
 def upload_file(file: UploadFile = File(...)):
     if not file.filename:
         raise HTTPException(status_code=400, detail="Filename is required")
+    clean_filename = unquote(file.filename)
 
     try:
         s3_client.upload_fileobj(
