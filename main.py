@@ -282,3 +282,23 @@ def get_track(track_id: str):
         raise HTTPException(status_code=404, detail=f"Track '{track_id}' not found")
 
     return dict(row)
+
+@app.delete("/api/tracks/{track_id:path}")
+def delete_track(track_id: str):
+    clean_id = unquote(track_id)
+    
+    # 1. Delete the actual audio file from Cloudflare R2
+    try:
+        s3_client.delete_object(Bucket=R2_BUCKET_NAME, Key=clean_id)
+    except (ClientError, BotoCoreError) as error:
+        logger.exception("R2 deletion failed for key %r", clean_id)
+        raise HTTPException(
+            status_code=502, 
+            detail="Failed to delete file from Cloudflare R2."
+        ) from error
+
+    # 2. Delete the track record from SQLite catalog.db
+    with get_connection() as connection:
+        connection.execute("DELETE FROM tracks WHERE id = ?", (clean_id,))
+
+    return {"deleted": True, "id": clean_id}
