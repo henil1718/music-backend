@@ -5,11 +5,10 @@ import sqlite3
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from urllib.parse import unquote
-
 
 load_dotenv()
 
@@ -180,15 +179,16 @@ def sync_tracks():
     return {"synced": True}
 
 
-# A plain "def" (not "async def") on purpose: boto3 is blocking, and FastAPI runs
-# plain functions in a worker thread, so a slow upload can't freeze the whole server.
 class PresignedUrlRequest(BaseModel):
     filename: str
     content_type: str
 
 @app.post("/api/upload/presigned")
 def get_presigned_url(request: PresignedUrlRequest):
-    filename = request.filename or ""
+    # Decode %20 and + back into normal spaces right away
+    raw_filename = request.filename or ""
+    filename = unquote(raw_filename).replace("+", " ")
+    
     extension = os.path.splitext(filename)[1].lower()
     content_type = request.content_type
 
@@ -225,25 +225,6 @@ def get_presigned_url(request: PresignedUrlRequest):
             status_code=502,
             detail="Could not generate upload link. Check the server logs.",
         )
-
-@app.post("/api/upload")
-def upload_file(file: UploadFile = File(...)):
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="Filename is required")
-    clean_filename = unquote(file.filename)
-
-    try:
-        s3_client.upload_fileobj(
-            file.file,
-            R2_BUCKET_NAME,
-            file.filename,
-            ExtraArgs={"ContentType": file.content_type or "audio/mpeg"},
-        )
-    except Exception as error:
-        logger.exception("R2 upload failed for %r", file.filename)
-        raise HTTPException(status_code=500, detail="Failed to upload to R2") from error
-
-    return {"uploaded": True, "key": file.filename}
 
 
 @app.get("/api/tracks")
