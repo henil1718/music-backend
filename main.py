@@ -151,8 +151,26 @@ def health_check():
 @app.post("/api/sync")
 def sync_tracks():
     response = s3_client.list_objects_v2(Bucket=R2_BUCKET_NAME)
+    
+    # 1. Get a list of all valid audio files currently in R2
+    valid_keys = [
+        item["Key"] for item in response.get("Contents", [])
+        if item["Key"].lower().endswith(AUDIO_EXTENSIONS)
+    ]
 
     with get_connection() as connection:
+        # 2. Delete any tracks from the database that no longer exist in R2
+        if valid_keys:
+            placeholders = ",".join("?" for _ in valid_keys)
+            connection.execute(
+                f"DELETE FROM tracks WHERE id NOT IN ({placeholders})", 
+                valid_keys
+            )
+        else:
+            # If the bucket is completely empty, wipe the database
+            connection.execute("DELETE FROM tracks")
+
+        # 3. Insert new tracks as usual
         for item in response.get("Contents", []):
             key = item["Key"]
             if not key.lower().endswith(AUDIO_EXTENSIONS):
