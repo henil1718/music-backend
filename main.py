@@ -1,14 +1,19 @@
+import html
+import json
 import logging
 import os
 import re
 import sqlite3
+import time
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from urllib.parse import unquote
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode, unquote
+from urllib.request import urlopen
 
 load_dotenv()
 
@@ -18,6 +23,7 @@ R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")
 R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY")
 R2_SECRET_KEY = os.getenv("R2_SECRET_KEY")
 R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME")
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 
 s3_client = boto3.client(
     "s3",
@@ -302,3 +308,149 @@ def delete_track(track_id: str):
         connection.execute("DELETE FROM tracks WHERE id = ?", (clean_id,))
 
     return {"deleted": True, "id": clean_id}
+
+# --- YouTube Discovery Search (Cached) --------------------------------------
+
+YOUTUBE_SEARCH_URL = "https://www.googleapis.com/youtube/v3/search"
+YOUTUBE_VIDEOS_URL = "https://www.googleapis.com/youtube/v3/videos"
+YOUTUBE_CACHE_TTL_SECONDS = 3600  # Cache identical searches for 1 hour to save quota
+MAX_YOUTUBE_CACHE_ENTRIES = 200
+
+# { normalized_query: (timestamp, results_list) }
+_youtube_search_cache = {}
+
+ISO_DURATION_RE = re.compile(
+    r"^PT(?:(?P<hours>\d+)H)?(?:(?P<minutes>\d+)M)?(?:(?P<seconds>\d+)S)?$"
+)
+
+
+def format_iso_duration(iso_str: str) -> str:
+    """Convert YouTube ISO-8601 duration (e.g. 'PT3M42S') into '3:42'."""
+    if not iso_str:
+        return ""
+    match = ISO_DURATION_RE.match(iso_str)
+    if not match:
+        return ""
+    hours = int(match.group("hours") or 0)
+    minutes = int(match.group("minutes") or 0)
+    seconds = int(match.group("seconds") or 0)
+    if hours > 0:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
+def fetch_youtube_json(url: str, params: dict) -> dict:
+    full_url = f"{url}?{urlencode(params)}"
+    try:
+        with urlopen(full_url, timeout=10) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        body = error.read().decode("utf-8", errors="ignore")
+        logger.error("YouTube API HTTP %s: %s", error.code, body[:300])
+        if error.code in (403, 429):
+            raise HTTPException(
+                status_code=503,
+                detail="YouTube API quota exceeded or key restricted. Try again later.",
+            ) from error
+        raise HTTPException(
+            status_code=502,
+            detail=f"YouTube API error ({error.code}).",
+        ) from error
+    except (URLError, TimeoutError) as error:
+        logger.error("YouTube API network error: %s", error)
+        raise HTTPException(
+            status_code=502,
+            detail="Could not reach YouTube servers.",
+        ) from error
+
+
+@app.get("/api/youtube/search")
+def search_youtube(q: str = Query(..., min_length=2, max_length=100)):
+    if not YOUTUBE_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="YOUTUBE_API_KEY is not configured on the server.",
+        )
+
+    normalized_query = " ".join(q.strip().lower().split())
+    if len(normalized_query) < 2:
+        return {"results": []}
+
+    now = time.time()
+    cached = _youtube_search_cache.get(normalized_query)
+    if cached and (now - cached[0]) < YOUTUBE_CACHE_TTL_SECONDS:
+        return {"results": cached[1], "cached": True}
+
+    # 1. Search YouTube videos via official Data API v3 search.list
+    search_data = fetch_youtube_json(
+        YOUTUBE_SEARCH_URL,
+        {
+            "part": "snippet",
+            "q": q.strip(),
+            "type": "video",
+            "maxResults": 15,
+            "safeSearch": "none",
+            "key": YOUTUBE_API_KEY,
+        },
+    )
+
+    raw_items = search_data.get("items", [])
+    video_ids = [
+        item.get("id", {}).get("videoId")
+        for item in raw_items
+        if item.get("id", {}).get("videoId")
+    ]
+
+    if not video_ids:
+        return {"results": []}
+
+    # 2. Batch-fetch video durations via videos.list (costs only 1 quota unit total)
+    durations_by_id = {}
+    try:
+        videos_data = fetch_youtube_json(
+            YOUTUBE_VIDEOS_URL,
+            {
+                "part": "contentDetails",
+                "id": ",".join(video_ids),
+                "key": YOUTUBE_API_KEY,
+            },
+        )
+        for v_item in videos_data.get("items", []):
+            vid = v_item.get("id")
+            iso_dur = v_item.get("contentDetails", {}).get("duration", "")
+            if vid:
+                durations_by_id[vid] = format_iso_duration(iso_dur)
+    except HTTPException:
+        # If duration lookup fails, still return the search results without durations
+        pass
+
+    results = []
+    for item in raw_items:
+        video_id = item.get("id", {}).get("videoId")
+        if not video_id:
+            continue
+        snippet = item.get("snippet", {})
+        thumbnails = snippet.get("thumbnails", {})
+        thumb_url = (
+            thumbnails.get("high", {}).get("url")
+            or thumbnails.get("medium", {}).get("url")
+            or thumbnails.get("default", {}).get("url")
+            or ""
+        )
+        results.append(
+            {
+                "video_id": video_id,
+                "title": html.unescape(snippet.get("title") or "Untitled"),
+                "channel": html.unescape(snippet.get("channelTitle") or "Unknown Channel"),
+                "thumbnail_url": thumb_url,
+                "duration": durations_by_id.get(video_id, ""),
+            }
+        )
+
+    # Evict oldest entry if cache is full
+    if len(_youtube_search_cache) >= MAX_YOUTUBE_CACHE_ENTRIES:
+        oldest_key = min(_youtube_search_cache, key=lambda k: _youtube_search_cache[k][0])
+        _youtube_search_cache.pop(oldest_key, None)
+
+    _youtube_search_cache[normalized_query] = (now, results)
+    return {"results": results, "cached": False}
